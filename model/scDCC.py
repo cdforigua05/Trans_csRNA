@@ -112,6 +112,7 @@ class scDCC(nn.Module):
             return self.cl_weight*cl_loss
 
     def pretrain_autoencoder(self, x, X_raw, size_factor, batch_size=256, lr=0.001, epochs=400, ae_save=True, ae_weights='AE_weights.pth.tar'):
+        breakpoint()
         use_cuda = torch.cuda.is_available()
         if use_cuda:
             self.cuda()
