@@ -5,12 +5,21 @@
 
 import math
 import torch
+import numpy as np
 import torch.nn as nn
+from torch.autograd import Variable
+import torch.optim as optim
+from sklearn.cluster import KMeans
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from models.layers import ZINBLoss, MeanAct, DispAct
-
+from model.layers import ZINBLoss, MeanAct, DispAct
+from torch.nn import Parameter
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import os
+from sklearn import metrics
+from utils import cluster_acc
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -637,12 +646,18 @@ class SwinIR(nn.Module):
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
                  use_checkpoint=False, upscale=2, img_range=1., upsampler='', resi_connection='1conv', input_dim=256,
+                 z_dim=32, n_clusters=8, sigma=1., alpha=1., args=None, 
                  **kwargs):
         super(SwinIR, self).__init__()
         num_in_ch = in_chans
         num_out_ch = in_chans
         num_feat = 64
+        self.z_dim = z_dim
+        self.n_clusters = n_clusters
         self.img_range = img_range
+        self.sigma = sigma
+        self.alpha = alpha
+        self.args = args
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)
             self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
@@ -721,13 +736,38 @@ class SwinIR(nn.Module):
         # for image denoising and JPEG compression artifact reduction
         self.conv_last = nn.Conv1d(embed_dim, 1, 1)
         self.pool =  nn.AdaptiveMaxPool1d(32)
-        self.recon_conv1 = nn.Linear(32, 64)
-        self.recon_conv2 = nn.Linear(64, 256)
+        self.reconstruction_layer = nn.Sequential(nn.Linear(32,64), 
+                                                nn.ReLU(),
+                                                nn.Linear(64,256),
+                                                nn.ReLU())
         self._mean = nn.Sequential(nn.Linear(256, input_dim), MeanAct())
         self._disp = nn.Sequential(nn.Linear(256, input_dim), DispAct())
         self._drop = nn.Sequential(nn.Linear(256, input_dim), nn.Sigmoid())
 
+        self.mu = Parameter(torch.Tensor(n_clusters, z_dim))
+        self.zinb_loss = ZINBLoss().cuda()
         self.apply(self._init_weights)
+
+    def save_model(self, path):
+        torch.save(self.state_dict(), path)
+    
+    def load_model(self, path):
+        pretrained_dict = torch.load(path, map_location=lambda storage, loc: storage)
+        model_dict = self.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict) 
+        self.load_state_dict(model_dict)
+
+    def soft_assign(self, z):
+        q = 1.0 / (1.0 + torch.sum((z.unsqueeze(1) - self.mu)**2, dim=2) / self.alpha)
+        q = q**((self.alpha+1.0)/2.0)
+        q = (q.t() / torch.sum(q, dim=1)).t()
+        return q
+    
+    def target_distribution(self, q):
+        p = q**2 / q.sum(0)
+        return (p.t() / p.sum(1)).t()
+
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -768,27 +808,202 @@ class SwinIR(nn.Module):
         return x
 
     def forward(self, x):
-        x = x[:,:,0,:]
+        x = x.unsqueeze(1)
         H = x.shape[2:]
         x = self.check_image_size(x)
         
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
-
-        # for image denoising and JPEG compression artifact reduction
-        x_first = self.conv_first(x)
+        xn = x+torch.randn_like(x) * self.sigma # Añadimos ruido gaussiano
+        x_first = self.conv_first(xn)
         res = self.conv_after_body(self.forward_features(x_first)) 
         res_conv = res+ x_first
         res_1d =  self.conv_last(res_conv)
-        res_red =  self.pool(res_1d).squeeze(1) # Espacio latente
-        rec1 = self.recon_conv1(res_red)
-        rec2 = self.recon_conv2(rec1)
-        
+        z =  self.pool(res_1d).squeeze(1) # Espacio latente
+        rec2 = self.reconstruction_layer(z)
         _mean = self._mean(rec2)
         _disp = self._disp(rec2)
-        _drop = self._drop(rec2)
+        _pi = self._drop(rec2)
 
-        return x[:, :, :H*self.upscale]
+        # Sin ruido
+        x_first0 = self.conv_first(x)
+        res0 = self.conv_after_body(self.forward_features(x_first)) 
+        res_conv0 = res+ x_first
+        res_1d0 =  self.conv_last(res_conv)
+        z0 =  self.pool(res_1d).squeeze(1)
+        q = self.soft_assign(z0)
+        return z0, q, _mean, _disp, _pi
+    
+    def encodeBatch(self, X, batch_size=256):
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            self.cuda()
+        
+        encoded = []
+        num = X.shape[0]
+        num_batch = int(math.ceil(1.0*X.shape[0]/batch_size))
+        for batch_idx in range(num_batch):
+            xbatch = X[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
+            inputs = Variable(xbatch)
+            z,_, _, _, _ = self.forward(inputs)
+            encoded.append(z.data)
+
+        encoded = torch.cat(encoded, dim=0)
+        return encoded
+    
+    def cluster_loss(self, p, q):
+        def kld(target, pred):
+            return torch.mean(torch.sum(target*torch.log(target/(pred+1e-6)), dim=-1))
+        kldloss = kld(p, q)
+        return kldloss
+    
+    def pretrain_autoencoder(self, x, X_raw, size_factor, batch_size=256, lr=0.001, epochs=400, ae_save=True, ae_weights='AE_weights.pth.tar'):
+        losses = []
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            self.cuda()
+        dataset = TensorDataset(torch.Tensor(x), torch.Tensor(X_raw), torch.Tensor(size_factor))
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        print("Pretraining stage")
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, amsgrad=True)
+        loss_best = float('inf')
+        for epoch in range(epochs):
+            loss_avg = 0
+            for batch_idx, (x_batch, x_raw_batch, sf_batch) in enumerate(dataloader):
+                x_tensor = Variable(x_batch).cuda()
+                x_raw_tensor = Variable(x_raw_batch).cuda()
+                sf_tensor = Variable(sf_batch).cuda()
+                _, _, mean_tensor, disp_tensor, pi_tensor = self.forward(x_tensor)
+                loss = self.zinb_loss(x=x_raw_tensor, mean=mean_tensor, disp=disp_tensor, pi=pi_tensor, scale_factor=sf_tensor)
+                loss_avg += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                print('Pretrain epoch [{}/{}], ZINB loss:{:.4f}'.format(batch_idx+1, epoch+1, loss.item()))
+                losses.append(loss.item())
+            loss_avg = loss_avg/(batch_idx+1)
+            if loss_avg<loss_best:
+                loss_best= loss_avg
+                torch.save({'ae_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict()},
+                    os.path.join("results", self.args.dataset, self.args.name, "pretrained", ae_weights))
+            print('Epoch {}, ZINB loss Epoch: {:.4f}, ZINB loss Best: {:.4f}'.format(epoch+1, loss_avg, loss_best))
+        if ae_save:
+            torch.save({'ae_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict()},
+                    os.path.join("results", self.args.dataset, self.args.name, "pretrained", ae_weights.replace(".pth.tar","last.pth.tar")))
+        plt.plot(losses)
+        plt.savefig(os.path.join("results", self.args.dataset, self.args.name,"loss0.png"))
+
+    def save_checkpoint(self, state, index, filename):
+        newfilename = os.path.join(filename, 'FTcheckpoint_%d.pth.tar' % index)
+        torch.save(state, newfilename)
+    
+    def cluster_loss(self, p, q):
+        def kld(target, pred):
+            return torch.mean(torch.sum(target*torch.log(target/(pred+1e-6)), dim=-1))
+        kldloss = kld(p, q)
+        return kldloss
+
+    def fit(self, X, X_raw, sf, y=None, lr=1., batch_size=256, num_epochs=10, update_interval=1, tol=1e-3, save_dir=""):
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            self.cuda()
+        print("Clustering stage")
+        X = torch.tensor(X).cuda()
+        X_raw = torch.tensor(X_raw).cuda()
+        sf = torch.tensor(sf).cuda()
+        optimizer = optim.Adadelta(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, rho=.95)
+        print("Initializing cluster centers with kmeans.")
+        kmeans = KMeans(self.n_clusters, n_init=20)
+        dataset = TensorDataset(X, X_raw, sf)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+        encoded = []
+        for batch_idx, (x_batch, x_raw_batch, sf_batch) in enumerate(dataloader):
+            print(batch_idx)
+            x_tensor = Variable(x_batch).cuda()
+            x_raw_tensor = Variable(x_raw_batch).cuda()
+            sf_tensor = Variable(sf_batch).cuda()
+            z,_, _, _, _ = self.forward(x_tensor)
+            encoded.append(z.data.cpu())
+        data = torch.cat(encoded, dim=0)
+        #data = self.encodeBatch(X,  batch_size=batch_size)
+        self.y_pred = kmeans.fit_predict(data.data.cpu().numpy())
+        self.y_pred_last = self.y_pred
+        self.mu.data.copy_(torch.Tensor(kmeans.cluster_centers_))
+        if y is not None:
+            acc = np.round(cluster_acc(y, self.y_pred), 5)
+            nmi = np.round(metrics.normalized_mutual_info_score(y, self.y_pred), 5)
+            ari = np.round(metrics.adjusted_rand_score(y, self.y_pred), 5)
+            print('Initializing k-means: ACC= %.4f, NMI= %.4f, ARI= %.4f' % (acc, nmi, ari))
+        self.train()
+        num = X.shape[0]
+        num_batch = int(math.ceil(1.0*X.shape[0]/batch_size))
+        final_acc, final_nmi, final_ari, final_epoch = 0, 0, 0, 0
+
+        for epoch in range(num_epochs):
+            if epoch%update_interval == 0:
+                latent = self.encodeBatch(X, batch_size=1)
+                q = self.soft_assign(latent)
+                p =  self.target_distribution(q).data
+
+                self.y_pred = torch.argmax(q, dim=1).data.cpu().numpy()
+                if y is not None:
+                    final_acc = acc = np.round(cluster_acc(y, self.y_pred), 5)
+                    final_nmi = nmi = np.round(metrics.normalized_mutual_info_score(y, self.y_pred), 5)
+                    final_epoch = ari = np.round(metrics.adjusted_rand_score(y, self.y_pred), 5)
+                    print('Clustering   %d: ACC= %.4f, NMI= %.4f, ARI= %.4f' % (epoch+1, acc, nmi, ari))
+
+                # save current model
+                if (epoch>0 and delta_label < tol) or epoch%10 == 0:
+                    self.save_checkpoint({'epoch': epoch+1,
+                            'state_dict': self.state_dict(),
+                            'mu': self.mu,
+                            'p': p,
+                            'q': q,
+                            'y_pred': self.y_pred,
+                            'y_pred_last': self.y_pred_last,
+                            'y': y
+                            }, epoch+1, filename=os.path.join("results", self.args.dataset, self.args.name, "checkpoints"))
+
+                # check stop criterion
+                delta_label = np.sum(self.y_pred != self.y_pred_last).astype(np.float32) / num
+                self.y_pred_last = self.y_pred
+                if epoch>0 and delta_label < tol:
+                    print('delta_label ', delta_label, '< tol ', tol)
+                    print("Reach tolerance threshold. Stopping training.")
+                    break
+            train_loss = 0.0
+            recon_loss_val = 0.0
+            cluster_loss_val = 0.0
+            for batch_idx in range(num_batch):
+                xbatch = X[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
+                xrawbatch = X_raw[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
+                sfbatch = sf[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
+                pbatch = p[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
+                optimizer.zero_grad()
+                inputs = Variable(xbatch)
+                rawinputs = Variable(xrawbatch)
+                sfinputs = Variable(sfbatch)
+                target = Variable(pbatch)
+
+                z, qbatch, meanbatch, dispbatch, pibatch = self.forward(inputs)
+
+                cluster_loss = self.cluster_loss(target, qbatch)
+                recon_loss = self.zinb_loss(rawinputs, meanbatch, dispbatch, pibatch, sfinputs)
+
+                loss = cluster_loss + recon_loss
+                loss.backward()
+                optimizer.step()
+
+                cluster_loss_val += cluster_loss.data * len(inputs)
+                recon_loss_val += recon_loss.data * len(inputs)
+                train_loss = cluster_loss_val + recon_loss_val
+            
+            print("#Epoch %3d: Total: %.4f Clustering Loss: %.4f ZINB Loss: %.4f" % (
+                epoch + 1, train_loss / num, cluster_loss_val / num, recon_loss_val / num))
+        return self.y_pred, final_acc, final_nmi, final_ari, final_epoch
+
 
     def flops(self):
         flops = 0

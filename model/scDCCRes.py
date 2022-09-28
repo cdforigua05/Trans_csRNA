@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.nn import Parameter
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
@@ -12,6 +13,13 @@ import math, os
 from sklearn import metrics
 from utils import cluster_acc
 import tqdm
+import random
+import torch
+import numpy as np
+np.random.seed(0)
+torch.manual_seed(0)
+random.seed(10)
+
 
 def buildNetwork(layers, type, activation="relu"):
     net = []
@@ -24,10 +32,10 @@ def buildNetwork(layers, type, activation="relu"):
     return nn.Sequential(*net)
 
 
-class scDCC(nn.Module):
+class scDCCRes(nn.Module):
     def __init__(self, input_dim, z_dim, n_clusters, encodeLayer=[], decodeLayer=[], 
             activation="relu", sigma=1., alpha=1., gamma=1., ml_weight=1., cl_weight=1., args=None):
-        super(scDCC, self).__init__()
+        super(scDCCRes, self).__init__()
         self.z_dim = z_dim
         self.n_clusters = n_clusters
         self.activation = activation
@@ -45,6 +53,8 @@ class scDCC(nn.Module):
 
         self.mu = Parameter(torch.Tensor(n_clusters, z_dim)) # Inicialización de los clusters
         self.zinb_loss = ZINBLoss().cuda()
+        self.recon_loss =  nn.MSELoss().cuda()
+        self.reconstruction =  nn.Sequential(nn.ReLU(), nn.Linear(decodeLayer[-1], input_dim))
         self.args = args
     
     def save_model(self, path):
@@ -74,11 +84,13 @@ class scDCC(nn.Module):
         _mean = self._dec_mean(h)
         _disp = self._dec_disp(h)
         _pi = self._dec_pi(h)
+        _recon = self.reconstruction(h)
         # Representaciones normales sin el ruido
         h0 = self.encoder(x)
         z0 = self._enc_mu(h0)
         q = self.soft_assign(z0)
-        return z0, q, _mean, _disp, _pi
+
+        return z0, q, _mean, _disp, _pi, _recon
     
     def encodeBatch(self, X, batch_size=256):
         use_cuda = torch.cuda.is_available()
@@ -122,17 +134,19 @@ class scDCC(nn.Module):
         loss_best = float('inf')
         for epoch in range(epochs):
             loss_avg = 0
-            for batch_idx, (x_batch, x_raw_batch, sf_batch) in enumerate(dataloader):
+            for batch_idx, (x_batch, x_raw_batch, sf_batch) in enumerate(dataloader ):
                 x_tensor = Variable(x_batch).cuda()
                 x_raw_tensor = Variable(x_raw_batch).cuda()
                 sf_tensor = Variable(sf_batch).cuda()
-                _, _, mean_tensor, disp_tensor, pi_tensor = self.forward(x_tensor)
+                _, _, mean_tensor, disp_tensor, pi_tensor, recon_tensor = self.forward(x_tensor)
                 loss = self.zinb_loss(x=x_raw_tensor, mean=mean_tensor, disp=disp_tensor, pi=pi_tensor, scale_factor=sf_tensor)
-                loss_avg += loss
+                loss_recon = self.recon_loss(x_raw_tensor, recon_tensor)
+                total_loss =  loss+loss_recon
+                loss_avg += total_loss
                 optimizer.zero_grad()
-                loss.backward()
+                total_loss.backward()
                 optimizer.step()
-                print('Pretrain epoch [{}/{}], ZINB loss:{:.4f}'.format(batch_idx+1, epoch+1, loss.item()))
+                print('Pretrain epoch [{}/{}], ZINB loss:{:.4f}, Recon loss:{:.4f}, Total loss:{:.4f}'.format(batch_idx+1, epoch+1, loss.item(), loss_recon.item(), total_loss.item()))
             loss_avg = loss_avg/(batch_idx+1)
             if loss_avg<loss_best:
                 loss_best= loss_avg
@@ -225,6 +239,7 @@ class scDCC(nn.Module):
             train_loss = 0.0
             recon_loss_val = 0.0
             cluster_loss_val = 0.0
+            l2_loss_val = 0.0
             for batch_idx in range(num_batch):
                 xbatch = X[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
                 xrawbatch = X_raw[batch_idx*batch_size : min((batch_idx+1)*batch_size, num)]
@@ -236,18 +251,20 @@ class scDCC(nn.Module):
                 sfinputs = Variable(sfbatch)
                 target = Variable(pbatch)
 
-                z, qbatch, meanbatch, dispbatch, pibatch = self.forward(inputs)
+                z, qbatch, meanbatch, dispbatch, pibatch, reconbatch = self.forward(inputs)
 
                 cluster_loss = self.cluster_loss(target, qbatch)
                 recon_loss = self.zinb_loss(rawinputs, meanbatch, dispbatch, pibatch, sfinputs)
-                loss = cluster_loss + recon_loss
+                l2_loss =  self.recon_loss(rawinputs, reconbatch )
+                loss = cluster_loss + recon_loss + l2_loss
                 loss.backward()
                 optimizer.step()
                 cluster_loss_val += cluster_loss.data * len(inputs)
                 recon_loss_val += recon_loss.data * len(inputs)
+                l2_loss_val += l2_loss * len(inputs)
                 train_loss = cluster_loss_val + recon_loss_val
-            print("#Epoch %3d: Total: %.4f Clustering Loss: %.4f ZINB Loss: %.4f" % (
-                epoch + 1, train_loss / num, cluster_loss_val / num, recon_loss_val / num))
+            print("#Epoch %3d: Total: %.4f Clustering Loss: %.4f ZINB Loss: %.4f Recon Loss: %.4f" % (
+                epoch + 1, train_loss / num, cluster_loss_val / num, recon_loss_val / num, l2_loss_val / num))
 
             ml_loss = 0.0
             if epoch % update_ml == 0:

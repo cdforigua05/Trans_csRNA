@@ -21,7 +21,12 @@ import argparse
 from load_dataset import load_dataset
 from model.select_model import select_model
 from utils import cluster_acc, generate_random_pair
-
+import random
+import torch
+import numpy as np
+np.random.seed(0)
+torch.manual_seed(0)
+random.seed(10)
 
 if __name__ == "__main__":
     # setting hyper parameters
@@ -33,7 +38,7 @@ if __name__ == "__main__":
     parser.add_argument('--label_cells_files', default='label_selected_cells_1.txt')
     parser.add_argument('--data_file', default='./datos/10x PBMC/')
     parser.add_argument('--maxiter', default=2000, type=int)
-    parser.add_argument('--pretrain_epochs', default=300, type=int)
+    parser.add_argument('--pretrain_epochs', default=3000, type=int)
     parser.add_argument('--gamma', default=1., type=float,
                         help='coefficient of clustering loss')
     parser.add_argument('--update_interval', default=1, type=int)
@@ -75,7 +80,6 @@ if __name__ == "__main__":
     adata = normalize(adata, args, size_factors=True, normalize_input=True, logtrans_input= True)
 
     print('### After Preprocessing: {} genes and {} cells.'.format(adata.n_vars, adata.n_obs))
-
     input_size = adata.n_vars
     if not os.path.exists(args.label_cells_files):
         np.random.seed(0)
@@ -88,7 +92,7 @@ if __name__ == "__main__":
     x_sd = adata.X.std(0) # Desviación estándar de los genes
     x_sd_median = np.median(x_sd) # Desviación media de los genes 
     print("median of gene sd: %.5f" % x_sd_median)
-
+    
     model = select_model(args=args, input_size=input_size)
 
     print(str(model))
@@ -106,15 +110,22 @@ if __name__ == "__main__":
             raise ValueError
 
     print('Pretraining time: %d seconds.' % int(time() - t0))
-
     # TODO: Esto es para scDCC. Hay que adaptar
     if args.model == "scDCC":
         ml_ind1, ml_ind2, cl_ind1, cl_ind2 = np.array([]), np.array([]), np.array([]), np.array([])
         y_pred, _, _, _, _ = model.fit(X=adata.X, X_raw=adata.raw.X, sf=adata.obs.size_factors, y=np.array(adata.obs.Group), batch_size=args.batch_size, num_epochs=args.maxiter, 
                     ml_ind1=ml_ind1, ml_ind2=ml_ind2, cl_ind1=cl_ind1, cl_ind2=cl_ind2,
                     update_interval=args.update_interval, tol=args.tol, save_dir=args.save_dir)
-    elif args.model == "Trans_scRNA":
+    elif args.model == "SwinIR":
+        y_pred, _, _, _, _ = model.fit(X=adata.X, X_raw=adata.raw.X, sf=adata.obs.size_factors, y=np.array(adata.obs.Group), batch_size=args.batch_size,
+                                    num_epochs=args.maxiter, update_interval=args.update_interval, tol=args.tol, save_dir=args.save_dir)
         pass
+    elif args.model == "scDCCRes":
+        ml_ind1, ml_ind2, cl_ind1, cl_ind2 = np.array([]), np.array([]), np.array([]), np.array([])
+        y_pred, _, _, _, _ = model.fit(X=adata.X, X_raw=adata.raw.X, sf=adata.obs.size_factors, y=np.array(adata.obs.Group), batch_size=args.batch_size, num_epochs=args.maxiter, 
+                    ml_ind1=ml_ind1, ml_ind2=ml_ind2, cl_ind1=cl_ind1, cl_ind2=cl_ind2,
+                    update_interval=args.update_interval, tol=args.tol, save_dir=args.save_dir)
+
     print('Total time: %d seconds.' % int(time() - t0))
 
     eval_cell_y_pred = np.delete(y_pred, label_cell_indx)

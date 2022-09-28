@@ -28,10 +28,10 @@ class Trans_scRNA(nn.Module):
         self.alpha = alpha
         self.embed = nn.Sequential(
             nn.Linear(self.input_dim, self.input_dim*3),
-            nn.ReLU(),
-            nn.Conv1d(1, self.z_dim, 3, stride=3)
+            nn.ReLU()
         )
-        self.positional_encoding = self.positional_encoding(self.input_dim, self.z_dim)
+        self.conv1 = nn.Conv1d(1, self.z_dim, 3, stride=3)
+        self.positional_encoding = torch.tensor(self.positional_encoding(self.input_dim, self.z_dim))
         encoder_layer = nn.TransformerEncoderLayer(d_model=self.z_dim, nhead=self.nhead)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layer)
 
@@ -39,8 +39,6 @@ class Trans_scRNA(nn.Module):
         decoder_layer = nn.TransformerDecoderLayer(d_model=self.z_dim, nhead=self.nhead)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.num_layer)
 
-        # Reduction
-        self.reduc = nn.Conv1d(32, 1, 1)
         self._dec_mean = nn.Sequential(nn.Conv1d(32, 1, 1), MeanAct())
         self._dec_disp = nn.Sequential(nn.Conv1d(32, 1, 1), DispAct())
         self._dec_pi = nn.Sequential(nn.Conv1d(32, 1, 1), nn.Sigmoid())
@@ -89,18 +87,17 @@ class Trans_scRNA(nn.Module):
         return pos_encoding
     
     def forward(self, x):
-        h = self.embed(x+torch.rand_like(x)*self.sigma)
-        h = h + self.positional_encoding
-        z =  self.transformer_encoder(h)
-        d = self.transformer_decoder(z)
-        __mean = self._dec_mean(d)
-        __disp = self._dec_disp(d)
-        __pi = self._dec_pi(d)
+        h = self.conv1(self.embed(x+torch.rand_like(x)*self.sigma).unsqueeze(1)).transpose(2,1)
+        h = h + self.positional_encoding.to(h.device)
+        z =  self.transformer_encoder(h.float())
+        d = self.transformer_decoder(z.float(),z.float()).transpose(2,1)
+        __mean = self._dec_mean(d).squeeze(1)
+        __disp = self._dec_disp(d).squeeze(1)
+        __pi = self._dec_pi(d).squeeze(1)
         # Representaciones normales sin el ruido
-        h0 = self.embed(x) + self.positional_encoding
-        z0 = self.transformer_encoder(h0)
-        z0 = self.reduc(z0)
-        q = self.soft_assign(z0)
+        h0 = self.conv1(self.embed(x).unsqueeze(1)).transpose(2,1) + self.positional_encoding.to(x.device)
+        z0 = self.transformer_encoder(h0.float())
+        q = self.soft_assign(z0.mean(1)) #TODO: revisar esto
         return z0, q, __mean, __disp, __pi
     
     def encodeBatch(self, X, batch_size=256):
@@ -127,7 +124,6 @@ class Trans_scRNA(nn.Module):
         return self.gamma*kldloss
     
     def pretrain_autoencoder(self, x, X_raw, size_factor, batch_size=256, lr=0.001, epochs=400, ae_save=True, ae_weights='AE_weights.pth.tar'):
-        breakpoint()
         use_cuda = torch.cuda.is_available()
         if use_cuda:
             self.cuda()
