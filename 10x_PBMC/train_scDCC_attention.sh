@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=6 python main.py --model scDCC --save_dir results/10X_PBMC --name 10X_PBCM_scDCC_attention_top10000 \
+--batch_size 256 --pretrain_epochs 300 --simple_attention --n_clusters 8 --top_genes 5000

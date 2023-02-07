@@ -12,6 +12,20 @@ import math, os
 from sklearn import metrics
 from utils import cluster_acc
 import tqdm
+import random
+import matplotlib.pyplot as plt
+
+def seed_torch(seed=0):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)#as reproducibility docs
+    torch.manual_seed(seed)# as reproducibility docs
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False# as reproducibility docs
+    torch.backends.cudnn.deterministic = True# as reproducibility docs
+
+seed_torch()
 
 def buildNetwork(layers, type, activation="relu"):
     net = []
@@ -28,6 +42,7 @@ class scDCC(nn.Module):
     def __init__(self, input_dim, z_dim, n_clusters, encodeLayer=[], decodeLayer=[], 
             activation="relu", sigma=1., alpha=1., gamma=1., ml_weight=1., cl_weight=1., args=None):
         super(scDCC, self).__init__()
+        seed_torch()
         self.z_dim = z_dim
         self.n_clusters = n_clusters
         self.activation = activation
@@ -43,9 +58,13 @@ class scDCC(nn.Module):
         self._dec_disp = nn.Sequential(nn.Linear(decodeLayer[-1], input_dim), DispAct())
         self._dec_pi = nn.Sequential(nn.Linear(decodeLayer[-1], input_dim), nn.Sigmoid())
 
-        self.mu = Parameter(torch.Tensor(n_clusters, z_dim)) # Inicialización de los clusters
+        self.mu = Parameter(torch.rand(n_clusters, z_dim, dtype=torch.float32)) # Inicialización de los clusters
         self.zinb_loss = ZINBLoss().cuda()
         self.args = args
+
+        # Attention
+        if args.simple_attention:
+            self.att = Parameter(torch.rand(input_dim, dtype=torch.float32))
     
     def save_model(self, path):
         torch.save(self.state_dict(), path)
@@ -68,6 +87,8 @@ class scDCC(nn.Module):
         return (p.t() / p.sum(1)).t()
     
     def forward(self, x):
+        if self.args.simple_attention:
+            x = x*self.att
         h = self.encoder(x+torch.randn_like(x) * self.sigma) # Entrada con ruido gaussiano
         z = self._enc_mu(h)
         h = self.decoder(z)
@@ -160,7 +181,6 @@ class scDCC(nn.Module):
         X_raw = torch.tensor(X_raw).cuda()
         sf = torch.tensor(sf).cuda()
         optimizer = optim.Adadelta(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, rho=.95)
-
         print("Initializing cluster centers with kmeans.")
         kmeans = KMeans(self.n_clusters, n_init=20, random_state=0)
         data = self.encodeBatch(X)
@@ -168,10 +188,11 @@ class scDCC(nn.Module):
         self.y_pred_last = self.y_pred
         self.mu.data.copy_(torch.Tensor(kmeans.cluster_centers_))
         if y is not None:
-            acc = np.round(cluster_acc(y, self.y_pred), 5)
+            acc = np.round(cluster_acc(y, self.y_pred, os.path.join("results", self.args.dataset, self.args.name)), 5)
             nmi = np.round(metrics.normalized_mutual_info_score(y, self.y_pred), 5)
             ari = np.round(metrics.adjusted_rand_score(y, self.y_pred), 5)
             print('Initializing k-means: ACC= %.4f, NMI= %.4f, ARI= %.4f' % (acc, nmi, ari))
+            return self.y_pred, acc, nmi, ari, 0
         
         self.train()
         num = X.shape[0]
@@ -219,7 +240,6 @@ class scDCC(nn.Module):
                     print('delta_label ', delta_label, '< tol ', tol)
                     print("Reach tolerance threshold. Stopping training.")
                     break
-
 
             # train 1 epoch for clustering loss
             train_loss = 0.0

@@ -81,19 +81,21 @@ def read_dataset(adata, transpose=False, test_split=False, copy=False):
 
     adata.obs['DCA_split'] = adata.obs['DCA_split'].astype('category')
     print('### Successfully Processed {} genes and {} cells.'.format(adata.n_vars, adata.n_obs))
-
+    #adata.obs.Group=adata.obs.Group-1
     return adata
 
 
-def normalize(adata, args, filter_min_counts=True, size_factors=True, normalize_input=True, logtrans_input=True):
+def preprocess(adata, args, filter_min_counts=True, size_factors=True, normalize_input=True, logtrans_input=True):
 
     if filter_min_counts:
         sc.pp.filter_genes(adata, min_counts=args.min_counts_cell)
         sc.pp.filter_cells(adata, min_counts=args.min_count_gene)
 
     if size_factors or normalize_input or logtrans_input:
+        data_raw =  adata.copy()
         adata.raw = adata.copy()
     else:
+        data_raw =  adata.copy()
         adata.raw = adata
 
     if size_factors:
@@ -107,7 +109,9 @@ def normalize(adata, args, filter_min_counts=True, size_factors=True, normalize_
         
     if args.top_genes > 0:
         sc.pp.highly_variable_genes(adata, n_top_genes=args.top_genes)
+        adata.raw = data_raw[:, adata.var.highly_variable]
         adata = adata[:, adata.var.highly_variable]
+        
 
     if normalize_input:
         sc.pp.scale(adata)

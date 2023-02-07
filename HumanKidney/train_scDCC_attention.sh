@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=6 python main.py --model scDCC --save_dir results/HumanKidney --name HumanKidney_scDCC_attention \
+--batch_size 256 --pretrain_epochs 300 --simple_attention --dataset HumanKidney --data_file ./datos/HumanKidney/data.h5 --n_clusters 11

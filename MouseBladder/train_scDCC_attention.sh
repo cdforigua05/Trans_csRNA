@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=4 python main.py --model scDCC --save_dir results/MouseBladder --name MouseBladder_scDCC_attention \
+--batch_size 256 --pretrain_epochs 300 --simple_attention --dataset MouseBladder  --data_file ./datos/MouseBladder/mouse_bladder_cell.h5 --n_clusters 16

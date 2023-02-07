@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=5 python main.py --model scDCC --save_dir results/HumanLiver --name HumanLiver_scDCC \
+--batch_size 256 --pretrain_epochs 300 --dataset HumanLiver --data_file ./datos/HumanLiver/HumanLiver_counts_top5000.h5 --n_clusters 12

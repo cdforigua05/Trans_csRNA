@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=4 python main.py --model scDCC --save_dir results/WormNeuron --name WormNeuron_scDCC_attention \
+--batch_size 256 --pretrain_epochs 300 --simple_attention --dataset WormNeuron --data_file ./datos/WormNeuron/worm_neuron_cell.h5 --n_clusters 10

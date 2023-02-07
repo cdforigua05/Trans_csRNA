@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=6 python main.py --model scDCC --save_dir results/Retinaschekar --name Retinaschekar_scDCC \
+--batch_size 256 --pretrain_epochs 1000 --dataset Retinaschekar --data_file ./datos/Retinaschekar/Shekhar_mouse_retina_raw_data.h5 --n_clusters 19
